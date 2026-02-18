@@ -7,12 +7,12 @@ Streamlit Community Cloud).
 
 Local run:
     pip install -r requirements.txt
-    streamlit run streamlit_dashboard_app.py
+    streamlit run streamlit_app.py
 
 Streamlit Community Cloud (recommended):
 1) Put this file in a GitHub repo.
 2) Add requirements (at minimum): streamlit, pandas, boto3
-3) Add Streamlit Secrets (Settings → Secrets) like:
+3) Add Streamlit Secrets (App → Settings → Secrets) like:
 
 [aws]
 aws_access_key_id = "AKIA...."
@@ -38,9 +38,11 @@ plus prediction columns (numeric and/or categorical).
 
 from __future__ import annotations
 
+import io
 import os
 from datetime import datetime
 from typing import List, Optional, Tuple
+from collections.abc import Mapping
 
 import pandas as pd
 import streamlit as st
@@ -48,11 +50,12 @@ import streamlit as st
 # Optional dependency (required for S3 mode)
 try:
     import boto3
-    from botocore.exceptions import ClientError, NoCredentialsError
+    from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
 except Exception:  # pragma: no cover
     boto3 = None
     ClientError = Exception
     NoCredentialsError = Exception
+    PartialCredentialsError = Exception
 
 
 # ----------------------------
@@ -72,52 +75,107 @@ DEFAULT_S3_LATEST_KEY = "datasets/predictions/unified_next30_predictions_LATEST.
 DEFAULT_S3_PREFIX = "datasets/predictions/"
 
 
+def _secrets_container():
+    """
+    Return the secrets object (works for Streamlit Secrets both locally and on Community Cloud).
+    """
+    try:
+        return st.secrets
+    except Exception:
+        return {}
+
+
 def _secret_get(*keys: str, default=None):
     """
-    Safe getter for Streamlit secrets.
-    Supports both flat secrets (st.secrets["AWS_ACCESS_KEY_ID"]) and TOML sections.
+    Robust getter for Streamlit secrets.
+    Works with Streamlit's Secrets object (not a plain dict) and with nested TOML sections.
 
     Examples:
         _secret_get("aws", "aws_access_key_id")
         _secret_get("s3", "bucket")
+        _secret_get("AWS_ACCESS_KEY_ID")  # top-level (env-like) secrets
     """
-    cur = st.secrets
+    cur = _secrets_container()
+
     for k in keys:
-        if isinstance(cur, dict) and k in cur:
-            cur = cur[k]
-        else:
+        # Mapping (dict-like) path
+        if isinstance(cur, Mapping):
+            if k in cur:
+                cur = cur[k]
+                continue
             return default
+
+        # Streamlit Secrets object path (supports `in` and indexing)
+        try:
+            if k in cur:
+                cur = cur[k]
+                continue
+            return default
+        except Exception:
+            return default
+
     return cur
+
+
+def _has_any_aws_secret() -> bool:
+    """
+    Returns True if any plausible AWS credential fields are present in secrets or env vars.
+    (Does not print values; only checks presence.)
+    """
+    # Nested [aws]
+    if _secret_get("aws", "aws_access_key_id") and _secret_get("aws", "aws_secret_access_key"):
+        return True
+
+    # Flat secrets
+    if _secret_get("AWS_ACCESS_KEY_ID") and _secret_get("AWS_SECRET_ACCESS_KEY"):
+        return True
+    if _secret_get("aws_access_key_id") and _secret_get("aws_secret_access_key"):
+        return True
+
+    # Environment variables fallback
+    if os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY"):
+        return True
+
+    return False
 
 
 def _boto3_client():
     """
-    Build an S3 client from Streamlit secrets.
-    If no secrets exist, boto3 will still try to use its default credential chain.
+    Build an S3 client from Streamlit secrets and/or environment variables.
+
+    Priority order:
+      1) Streamlit Secrets nested section: [aws]
+      2) Streamlit Secrets top-level keys: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+      3) Environment variables: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+      4) boto3 default credential chain (rarely works on Streamlit Cloud)
+
+    NOTE:
+    - Streamlit Community Cloud does not provide an IAM role, so (1)/(2)/(3) are required.
     """
     if boto3 is None:
         return None
 
-    # Support [aws] section (recommended)
-    aws_access_key_id = (
-        _secret_get("aws", "aws_access_key_id", default=None)
-        or _secret_get("AWS_ACCESS_KEY_ID", default=None)
-    )
-    aws_secret_access_key = (
-        _secret_get("aws", "aws_secret_access_key", default=None)
-        or _secret_get("AWS_SECRET_ACCESS_KEY", default=None)
-    )
-    aws_session_token = (
-        _secret_get("aws", "aws_session_token", default=None)
-        or _secret_get("AWS_SESSION_TOKEN", default=None)
-    )
-    region = (
-        _secret_get("aws", "region", default=None)
-        or _secret_get("AWS_DEFAULT_REGION", default=None)
-        or "eu-north-1"
-    )
+    # 1) Nested [aws] section (recommended)
+    aws_access_key_id = _secret_get("aws", "aws_access_key_id", default=None)
+    aws_secret_access_key = _secret_get("aws", "aws_secret_access_key", default=None)
+    aws_session_token = _secret_get("aws", "aws_session_token", default=None)
+    region = _secret_get("aws", "region", default=None)
+
+    # 2) Top-level secrets (env-like)
+    aws_access_key_id = aws_access_key_id or _secret_get("AWS_ACCESS_KEY_ID", default=None) or _secret_get("aws_access_key_id", default=None)
+    aws_secret_access_key = aws_secret_access_key or _secret_get("AWS_SECRET_ACCESS_KEY", default=None) or _secret_get("aws_secret_access_key", default=None)
+    aws_session_token = aws_session_token or _secret_get("AWS_SESSION_TOKEN", default=None)
+    region = region or _secret_get("AWS_DEFAULT_REGION", default=None) or _secret_get("region", default=None)
+
+    # 3) Environment variables fallback
+    aws_access_key_id = aws_access_key_id or os.getenv("AWS_ACCESS_KEY_ID")
+    aws_secret_access_key = aws_secret_access_key or os.getenv("AWS_SECRET_ACCESS_KEY")
+    aws_session_token = aws_session_token or os.getenv("AWS_SESSION_TOKEN")
+    region = region or os.getenv("AWS_DEFAULT_REGION") or "eu-north-1"
 
     kwargs = {"region_name": region}
+
+    # Only pass explicit creds if we have both key+secret
     if aws_access_key_id and aws_secret_access_key:
         kwargs.update(
             {
@@ -190,7 +248,7 @@ def _list_s3_keys(bucket: str, prefix: str, limit: int = 200) -> List[str]:
 
 @st.cache_data(show_spinner=False)
 def load_predictions_from_bytes(csv_bytes: bytes) -> pd.DataFrame:
-    return pd.read_csv(pd.io.common.BytesIO(csv_bytes))
+    return pd.read_csv(io.BytesIO(csv_bytes))
 
 
 @st.cache_data(show_spinner=False)
@@ -212,6 +270,27 @@ def coerce_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
+
+
+def _credentials_help_text() -> str:
+    """
+    Returns a user-facing help message when credentials are missing.
+    Does not include any secrets.
+    """
+    return (
+        "AWS credentials not found.\n\n"
+        "✅ On **Streamlit Community Cloud** you must add Secrets:\n"
+        "App → **Settings** → **Secrets** and paste:\n\n"
+        "[aws]\n"
+        'aws_access_key_id = "AKIA...."\n'
+        'aws_secret_access_key = "...."\n'
+        'region = "eu-north-1"\n\n'
+        "[s3]\n"
+        f'bucket = "{DEFAULT_S3_BUCKET}"\n'
+        f'latest_key = "{DEFAULT_S3_LATEST_KEY}"\n'
+        f'prefix = "{DEFAULT_S3_PREFIX}"\n\n'
+        "Then click **Save changes** and **Reboot app**.\n"
+    )
 
 
 def main() -> None:
@@ -239,6 +318,11 @@ def main() -> None:
     if mode.startswith("S3"):
         if boto3 is None:
             st.error("S3 mode requires boto3. Add `boto3` to requirements.txt and redeploy.")
+            st.stop()
+
+        # Fast, explicit check to avoid confusing boto3 errors on Streamlit Cloud.
+        if not _has_any_aws_secret():
+            st.error(_credentials_help_text())
             st.stop()
 
         bucket = st.sidebar.text_input(
@@ -275,10 +359,8 @@ def main() -> None:
         try:
             csv_bytes = _download_s3_object(bucket, key, cache_buster=cache_buster)
             df = load_predictions_from_bytes(csv_bytes)
-        except NoCredentialsError:
-            st.error(
-                "AWS credentials not found. If you are on Streamlit Community Cloud, set Secrets as described in the file header."
-            )
+        except (NoCredentialsError, PartialCredentialsError):
+            st.error(_credentials_help_text())
             st.stop()
         except ClientError as e:
             st.error(f"Could not read s3://{bucket}/{key}. Check IAM permissions and the object path.\n\n{e}")
@@ -405,7 +487,10 @@ def main() -> None:
         df_plot.index = range(len(df_plot))
 
     default_plot_cols = [c for c in ["dust_event_prob", "pm10", "pm25", "aod", "temp_mean", "wind_speed_mean"] if c in df_city.columns]
-    numeric_cols = [c for c in df_city.columns if pd.api.types.is_numeric_dtype(df_city[c]) and c not in ["dust_event_pred", "drought_flag_pred"]]
+    numeric_cols = [
+        c for c in df_city.columns
+        if pd.api.types.is_numeric_dtype(df_city[c]) and c not in ["dust_event_pred", "drought_flag_pred"]
+    ]
 
     plot_cols = st.multiselect(
         "Select numeric variables to plot",
