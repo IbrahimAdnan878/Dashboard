@@ -1,66 +1,37 @@
-#!/usr/bin/env python3
 """
-Mitigation Engine for Dust + Drought + Flood (post-prediction decision layer)
+Mitigation Engine (v3) — Dust + Drought + Flood (rule-based)
 
-What this module does
----------------------
-Given ONE prediction row (per city, date), it returns:
-- risk summary (hazards detected + overall risk level)
-- recommended mitigation actions (ranked)
-- action triggers (why the action fired)
-- optional logging payload (for S3/DB)
+Purpose
+- Reads ONE prediction row (dict-like) produced by your ML/pipeline.
+- Detects hazard risks using robust column mappings.
+- Returns a structured MitigationResult used by Streamlit to render action cards.
 
-Design goals
-------------
-1) Transparent & auditable (rule-based, no black-box post-processing).
-2) Easy to extend (add new hazard modules and actions without changing the dashboard).
-3) Dashboard-friendly outputs (lists of "action cards").
-
-Expected inputs (typical)
--------------------------
-Dust (examples):
-- dust_event_pred, dust_event_prob, dust_intensity_level, dust_intensity_code
-- pm10, pm25, aod, wind_speed_mean (or wind_speed_10m_pred)
-
-Drought (examples):
-- drought_flag_pred, drought_severity_pred
-- precip_deficit_pred, drought_duration_pred, precipitation_sum_pred
-
-Flood / heavy-rainfall (examples):
-- precipitation_sum_pred (daily rainfall, mm)
-- precipitation_sum_normal (daily climatological normal, mm) [optional but improves anomaly detection]
-
-Notes
------
-- The mitigation engine DOES NOT update or overwrite your prediction dataset.
-- It reads one row and produces a decision/alert layer for the dashboard.
+Design notes (important)
+- Your current prediction CSV has many "binary/class" outputs always 0 / 'none'.
+  Therefore v3 uses both:
+    (A) model outputs (e.g., dust_event_pred, drought_severity_pred)
+    (B) continuous signals (dust_event_prob, pm10, pm25, aod, wind_speed_mean, precip_deficit_pred)
+- Flood detection relies on precipitation_sum_pred (currently all zeros in your file),
+  so flood will not trigger until precipitation forecasts are non-zero.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional, Tuple
-import hashlib
-import json
-from datetime import datetime
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 
-# ---------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------
-
-def _safe_int(x: Any, default: int = 0) -> int:
-    try:
-        if x is None:
-            return default
-        if isinstance(x, bool):
-            return int(x)
-        return int(float(x))
-    except Exception:
-        return default
+# -----------------------------
+# Helpers
+# -----------------------------
+def _get(row: Dict[str, Any], *keys: str, default=None):
+    for k in keys:
+        if k in row and row[k] is not None:
+            return row[k]
+    return default
 
 
-def _safe_float(x: Any, default: float = 0.0) -> float:
+def _to_float(x: Any, default: float = 0.0) -> float:
     try:
         if x is None:
             return default
@@ -69,455 +40,423 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
         return default
 
 
-def _norm_severity_str(s: Any) -> str:
-    if s is None:
-        return "unknown"
-    s = str(s).strip().lower()
-    mapping = {
-        "0": "none",
-        "1": "moderate",
-        "2": "severe",
-        "3": "extreme",
-        "no": "none",
-        "yes": "severe",
-    }
-    return mapping.get(s, s)
+def _to_str(x: Any, default: str = "") -> str:
+    try:
+        if x is None:
+            return default
+        return str(x)
+    except Exception:
+        return default
 
 
-def _stable_id(*parts: str) -> str:
-    h = hashlib.sha1("::".join(parts).encode("utf-8")).hexdigest()
-    return h[:12]
+def _norm_label(x: Any) -> str:
+    s = _to_str(x, "").strip().lower()
+    return s
 
 
-# ---------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------
-
+# -----------------------------
+# Result object
+# -----------------------------
 @dataclass
 class Action:
-    action_id: str
-    hazard: str              # "dust" | "drought" | "flood"
-    sector: str              # "health", "transport", "water", "agriculture", "environment", "operations", "emergency"
     title: str
+    hazard: str
+    sector: str
+    priority: str  # LOW / MEDIUM / HIGH
     description: str
     lead_agency: str
-    time_to_act: str         # "0-6h", "6-24h", "2-7d", "2-4w", "seasonal"
-    cost_level: str          # "low", "medium", "high"
-    priority: int            # higher = more urgent
-    triggers: List[str]      # explanation strings
+    time_to_act: str
+    cost_level: str
+    triggers: List[str] = field(default_factory=list)
 
 
 @dataclass
 class MitigationResult:
     city: str
     date: str
-    hazards_detected: List[str]
-    risk_level: str
-    actions: List[Action]
-    debug: Dict[str, Any]
+    risk_level: str  # low/moderate/high/extreme
+    hazards_detected: List[str] = field(default_factory=list)
+    actions: List[Action] = field(default_factory=list)
 
 
-# ---------------------------------------------------------------------
-# Default action catalog
-# ---------------------------------------------------------------------
-
-def default_action_catalog() -> List[Dict[str, Any]]:
+# -----------------------------
+# Core logic
+# -----------------------------
+def recommend_actions(row: Dict[str, Any]) -> MitigationResult:
     """
-    A compact but complete catalog.
-    Tailor 'lead_agency' to your local context (e.g., Mosul municipality, civil defense, health directorate).
+    Main entry point used by Streamlit.
+
+    Expected row keys (any subset is okay; v3 is robust):
+      - city, timestamp/date
+      - Dust: dust_event_pred, dust_event_prob, dust_intensity_level, pm10, pm25, aod, wind_speed_mean
+      - Drought: drought_flag_pred, drought_severity_pred, precip_deficit_pred, drought_duration_pred
+      - Flood: precipitation_sum_pred, precipitation_sum_normal
     """
-    return [
-        # -------------------- DUST: HEALTH --------------------
-        dict(hazard="dust", sector="health", title="Public health alert (masking + indoor stay)",
-             description="Issue advisory to reduce outdoor exposure; recommend N95/FFP2 masks for high-risk groups; promote indoor air filtration where possible.",
-             lead_agency="Health Directorate", time_to_act="0-6h", cost_level="low"),
-        dict(hazard="dust", sector="health", title="Healthcare readiness (respiratory surge planning)",
-             description="Notify hospitals/clinics to prepare for increased respiratory cases; ensure inhalers/oxygen availability.",
-             lead_agency="Health Directorate", time_to_act="6-24h", cost_level="medium"),
+    city = _to_str(_get(row, "city", default="Unknown"), "Unknown")
 
-        # -------------------- DUST: TRANSPORT/OPERATIONS --------------------
-        dict(hazard="dust", sector="transport", title="Traffic visibility protocol",
-             description="Coordinate with traffic police: temporary speed limits, warning signs, consider restricting highway travel if visibility is very low.",
-             lead_agency="Traffic Police / Municipality", time_to_act="0-6h", cost_level="low"),
-        dict(hazard="dust", sector="transport", title="Aviation/port advisory",
-             description="Inform airport/port operations of high dust risk; review contingency for delays and safety checks.",
-             lead_agency="Transport Authority", time_to_act="6-24h", cost_level="low"),
-        dict(hazard="dust", sector="operations", title="Outdoor work restriction (construction + municipal workers)",
-             description="Advise limiting outdoor work during peak dust hours; provide PPE to essential workers.",
-             lead_agency="Municipality / Labor Dept", time_to_act="0-6h", cost_level="low"),
-
-        # -------------------- DUST: ENVIRONMENT (short-term) --------------------
-        dict(hazard="dust", sector="environment", title="Dust suppression hotspot actions",
-             description="Target known dust hotspots: street sweeping/wetting, construction dust control, enforce covering of loose materials.",
-             lead_agency="Municipality / Environment Dept", time_to_act="2-7d", cost_level="medium"),
-
-        # -------------------- DROUGHT: WATER --------------------
-        dict(hazard="drought", sector="water", title="Water conservation advisory (public + institutions)",
-             description="Launch water-saving advisories; reduce non-essential use; coordinate with schools/hospitals for conservation plans.",
-             lead_agency="Water Directorate", time_to_act="2-7d", cost_level="low"),
-        dict(hazard="drought", sector="water", title="Escalated rationing plan (staged restrictions)",
-             description="Prepare staged rationing (Level 1/2/3) based on drought severity; prioritize drinking water and critical services.",
-             lead_agency="Water Directorate", time_to_act="2-4w", cost_level="medium"),
-        dict(hazard="drought", sector="water", title="Groundwater monitoring + extraction control",
-             description="Increase monitoring of groundwater levels; coordinate restrictions to prevent over-extraction during severe drought.",
-             lead_agency="Water Resources / Environment Dept", time_to_act="2-4w", cost_level="medium"),
-
-        # -------------------- DROUGHT: AGRICULTURE --------------------
-        dict(hazard="drought", sector="agriculture", title="Irrigation scheduling + drip irrigation support",
-             description="Promote efficient irrigation schedules; support drip systems where feasible; reduce losses in channels.",
-             lead_agency="Agriculture Directorate", time_to_act="2-4w", cost_level="high"),
-        dict(hazard="drought", sector="agriculture", title="Crop advisory (shift to drought-tolerant varieties)",
-             description="Provide guidance to farmers on crop switching, planting calendar adjustments, and drought-tolerant varieties.",
-             lead_agency="Agriculture Directorate", time_to_act="seasonal", cost_level="medium"),
-
-        # -------------------- DROUGHT: ENVIRONMENT (long-term) --------------------
-        dict(hazard="drought", sector="environment", title="Anti-desertification and vegetation restoration plan",
-             description="Plan shelterbelts/afforestation, soil conservation, and rangeland management to reduce dust sources and drought vulnerability.",
-             lead_agency="Environment / Agriculture", time_to_act="seasonal", cost_level="high"),
-
-        # -------------------- FLOOD: EMERGENCY / OPERATIONS --------------------
-        dict(hazard="flood", sector="emergency", title="Heavy-rain alert + public safety guidance",
-             description="Issue warning for heavy rain / flash flood risk; advise against crossing wadis/low bridges; share emergency contact numbers.",
-             lead_agency="Civil Defense / Municipality", time_to_act="0-6h", cost_level="low"),
-        dict(hazard="flood", sector="operations", title="Drainage and culvert inspection (hotspots)",
-             description="Inspect and clear stormwater drains, culverts, and known blockage points; deploy rapid-response municipal teams.",
-             lead_agency="Municipality / Water & Sewage", time_to_act="0-6h", cost_level="medium"),
-        dict(hazard="flood", sector="transport", title="Road closures and traffic rerouting plan",
-             description="Prepare to close flooded underpasses/low areas; coordinate detours; place warning signage and barriers.",
-             lead_agency="Traffic Police / Municipality", time_to_act="0-6h", cost_level="low"),
-        dict(hazard="flood", sector="emergency", title="Pre-position pumps/sandbags and response teams",
-             description="Stage portable pumps, sandbags, and rescue teams near vulnerable districts; verify shelters and evacuation routes if needed.",
-             lead_agency="Civil Defense", time_to_act="6-24h", cost_level="high"),
-    ]
-
-
-# ---------------------------------------------------------------------
-# Rule modules
-# ---------------------------------------------------------------------
-
-def _dust_severity_from_row(row: Dict[str, Any]) -> Tuple[int, List[str]]:
-    """
-    Returns dust severity level 0..3 and trigger notes.
-    Uses dust_intensity_level if present; otherwise derives from pollutants/wind proxies.
-    """
-    notes: List[str] = []
-    lvl: Optional[int] = None
-
-    # If your pipeline uses numeric codes 0..3 here
-    if "dust_intensity_level" in row:
-        lvl = _safe_int(row.get("dust_intensity_level"), 0)
-        notes.append(f"dust_intensity_level={lvl}")
-
-    if lvl is None:
-        pm10 = _safe_float(row.get("pm10_pred") or row.get("pm10"), 0.0)
-        pm25 = _safe_float(row.get("pm25_pred") or row.get("pm25"), 0.0)
-        aod  = _safe_float(row.get("aod_pred")  or row.get("aod"),  0.0)
-        wind = _safe_float(row.get("wind_speed_10m_pred") or row.get("wind_speed_mean") or row.get("wind_speed_10m"), 0.0)
-
-        # Simple, transparent thresholds (can be tuned to local standards)
-        if (pm10 > 450) or (pm25 > 250) or (aod > 1.2):
-            lvl = 3
-        elif (pm10 > 300) or (pm25 > 150) or (aod > 0.9):
-            lvl = 2
-        elif (pm10 > 200) or (pm25 > 100) or (aod > 0.7) or ((aod > 0.8) and (wind > 8)):
-            lvl = 1
-        else:
-            lvl = 0
-        notes.append("dust:derived_from_pm_aod_wind")
-
-    lvl = max(0, min(3, int(lvl)))
-    return lvl, notes
-
-
-def _drought_severity_from_row(row: Dict[str, Any]) -> Tuple[str, List[str]]:
-    notes: List[str] = []
-    sev = "unknown"
-
-    # Prefer categorical drought severity
-    if "drought_severity_pred" in row:
-        sev = _norm_severity_str(row.get("drought_severity_pred"))
-        notes.append(f"drought_severity_pred={sev}")
-    elif "drought_severity" in row:
-        sev = _norm_severity_str(row.get("drought_severity"))
-        notes.append(f"drought_severity={sev}")
-
-    # If only drought_flag exists, approximate
-    if sev in ("unknown", "", "nan") and ("drought_flag_pred" in row or "drought_flag" in row):
-        flag = _safe_int(row.get("drought_flag_pred") or row.get("drought_flag"), 0)
-        sev = "none" if flag == 0 else "severe"
-        notes.append(f"drought_flag={flag}")
-
-    # If still unknown, try proxies available in your current CSV
-    if sev == "unknown":
-        # Your file has: precip_deficit_pred and drought_duration_pred
-        deficit = _safe_float(row.get("precip_deficit_pred"), 0.0)   # (pred - normal) or similar
-        duration = _safe_float(row.get("drought_duration_pred"), 0.0)
-
-        # Transparent heuristic: bigger deficit + longer duration => more severe drought
-        if (deficit < -30.0) and (duration >= 30):
-            sev = "extreme"
-        elif (deficit < -20.0) and (duration >= 14):
-            sev = "severe"
-        elif (deficit < -10.0) or (duration >= 7):
-            sev = "moderate"
-        else:
-            sev = "none"
-        notes.append("drought:derived_from_deficit_duration")
-
-    allowed = {"none", "moderate", "severe", "extreme"}
-    if sev not in allowed:
-        sev = "unknown"
-    return sev, notes
-
-
-def _flood_severity_from_row(row: Dict[str, Any]) -> Tuple[int, List[str]]:
-    """
-    Flood / heavy-rainfall severity level 0..3 from precipitation prediction.
-
-    Works with your current prediction CSV columns:
-    - precipitation_sum_pred (daily rainfall, mm)
-    - precipitation_sum_normal (daily normal, mm)  [optional]
-
-    Heuristic thresholds (tune later with local hydrology):
-    - lvl 1 (moderate): >= 30 mm/day OR (>= 20 and >= 2x normal)
-    - lvl 2 (high):     >= 50 mm/day OR (>= 35 and >= 2x normal)
-    - lvl 3 (extreme):  >= 80 mm/day OR (>= 60 and >= 2.5x normal)
-    """
-    notes: List[str] = []
-    rain = _safe_float(row.get("precipitation_sum_pred") or row.get("precipitation_sum"), 0.0)
-    normal = _safe_float(row.get("precipitation_sum_normal"), 0.0)
-
-    ratio = None
-    if normal and normal > 0:
-        ratio = rain / normal
-        notes.append(f"rain_ratio={ratio:.2f}")
-
-    lvl = 0
-    # Extreme
-    if (rain >= 80.0) or (ratio is not None and rain >= 60.0 and ratio >= 2.5):
-        lvl = 3
-    # High
-    elif (rain >= 50.0) or (ratio is not None and rain >= 35.0 and ratio >= 2.0):
-        lvl = 2
-    # Moderate
-    elif (rain >= 30.0) or (ratio is not None and rain >= 20.0 and ratio >= 2.0):
-        lvl = 1
-
-    notes.append(f"precipitation_sum_pred={rain:.1f}mm")
-    if normal:
-        notes.append(f"precipitation_sum_normal={normal:.1f}mm")
-
-    return lvl, notes
-
-
-# ---------------------------------------------------------------------
-# Scoring helpers
-# ---------------------------------------------------------------------
-
-def _priority_base(hazard: str, severity: Any) -> int:
-    if hazard == "dust":
-        return int(severity)  # 0..3
-    if hazard == "drought":
-        m = {"none": 0, "moderate": 1, "severe": 2, "extreme": 3}
-        return m.get(str(severity), 0)
-    if hazard == "flood":
-        return int(severity)  # 0..3
-    return 0
-
-
-# ---------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------
-
-def recommend_actions(
-    row: Dict[str, Any],
-    catalog: Optional[List[Dict[str, Any]]] = None,
-    min_priority: int = 1,
-) -> MitigationResult:
-    """
-    Main entry point.
-    - row: one prediction record (city + date + predicted fields)
-    - returns MitigationResult with ranked actions.
-    """
-    catalog = catalog or default_action_catalog()
-
-    city = str(row.get("city", "Unknown")).strip()
-    date = str(row.get("date") or row.get("timestamp") or row.get("day") or "Unknown").split(" ")[0]
+    # date handling (dashboard supplies either date or timestamp)
+    date = _to_str(_get(row, "date", "timestamp", default="Unknown"), "Unknown")
+    if " " in date:
+        date = date.split(" ")[0]
 
     hazards: List[str] = []
-    debug: Dict[str, Any] = {"input_keys": sorted(list(row.keys()))}
-
-    # Detect dust
-    dust_event = _safe_int(row.get("dust_event_pred") or row.get("dust_event"), 0)
-    dust_lvl, dust_notes = _dust_severity_from_row(row)
-    if dust_event == 1 or dust_lvl > 0:
-        hazards.append("dust")
-    debug["dust"] = {"event": dust_event, "level": dust_lvl, "notes": dust_notes}
-
-    # Detect drought
-    drought_flag = _safe_int(row.get("drought_flag_pred") or row.get("drought_flag"), 0)
-    drought_sev, drought_notes = _drought_severity_from_row(row)
-    if drought_flag == 1 or drought_sev in ("moderate", "severe", "extreme"):
-        hazards.append("drought")
-    debug["drought"] = {"flag": drought_flag, "severity": drought_sev, "notes": drought_notes}
-
-    # Detect flood / heavy rain
-    flood_lvl, flood_notes = _flood_severity_from_row(row)
-    if flood_lvl > 0:
-        hazards.append("flood")
-    debug["flood"] = {"level": flood_lvl, "notes": flood_notes}
-
-    # Overall risk label (max severity across hazards)
-    risk_score = 0
-    risk_score = max(risk_score, dust_lvl)
-    risk_score = max(risk_score, _priority_base("drought", drought_sev))
-    risk_score = max(risk_score, flood_lvl)
-
-    risk_map = {0: "low", 1: "moderate", 2: "high", 3: "extreme"}
-    risk_level = risk_map.get(risk_score, "unknown")
-
-    # Build actions
     actions: List[Action] = []
-    for item in catalog:
-        hz = item["hazard"]
-        if hz not in hazards:
-            continue
 
-        if hz == "dust":
-            base = _priority_base("dust", dust_lvl)
-        elif hz == "drought":
-            base = _priority_base("drought", drought_sev)
-        else:
-            base = _priority_base("flood", flood_lvl)
+    # -----------------------------
+    # Dust detection (hybrid: model output + continuous signals)
+    # -----------------------------
+    dust_pred = _to_float(_get(row, "dust_event_pred", "dust_event", default=0.0))
+    dust_prob = _to_float(_get(row, "dust_event_prob", default=0.0))
+    dust_level = _norm_label(_get(row, "dust_intensity_level", default=""))
+    pm10 = _to_float(_get(row, "pm10", "pm10_pred", default=0.0))
+    pm25 = _to_float(_get(row, "pm25", "pm25_pred", default=0.0))
+    aod = _to_float(_get(row, "aod", "aod_pred", default=0.0))
+    wind = _to_float(_get(row, "wind_speed_mean", "wind_speed_10m_pred", default=0.0))
 
-        if base < min_priority:
-            continue
+    dust_triggered = False
+    dust_priority = "LOW"
+    dust_triggers: List[str] = []
 
-        include = True
-        trig: List[str] = []
+    # Strong triggers
+    if dust_pred >= 1:
+        dust_triggered = True
+        dust_priority = "HIGH"
+        dust_triggers.append("dust_event_pred>=1")
 
-        # ---------------- hazard-specific gating ----------------
-        if hz == "dust":
-            if dust_lvl >= 3:
-                trig.append("dust_level>=3")
-            elif dust_lvl == 2:
-                trig.append("dust_level==2")
-            elif dust_lvl == 1:
-                if item["time_to_act"] not in ("0-6h", "6-24h"):
-                    include = False
-                trig.append("dust_level==1")
+    if dust_level in {"severe", "high"}:
+        dust_triggered = True
+        dust_priority = "HIGH"
+        dust_triggers.append(f"dust_intensity_level={dust_level}")
 
-        elif hz == "drought":
-            if drought_sev == "extreme":
-                trig.append("drought=extreme")
-            elif drought_sev == "severe":
-                trig.append("drought=severe")
-            elif drought_sev == "moderate":
-                if item["time_to_act"] in ("seasonal",):
-                    include = False
-                trig.append("drought=moderate")
+    # Probabilistic triggers (important for your current file where dust_event_pred is always 0)
+    # Calibrated tiers:
+    # - >=0.20: high confidence
+    # - >=0.10: moderate
+    # - >=0.05: low (useful because your current max is ~0.08)
+    if dust_prob >= 0.20:
+        dust_triggered = True
+        dust_priority = "HIGH"
+        dust_triggers.append("dust_event_prob>=0.20")
+    elif dust_prob >= 0.10:
+        dust_triggered = True
+        dust_priority = max(dust_priority, "MEDIUM", key=["LOW","MEDIUM","HIGH"].index)
+        dust_triggers.append("dust_event_prob>=0.10")
+    elif dust_prob >= 0.05:
+        dust_triggered = True
+        dust_priority = max(dust_priority, "LOW", key=["LOW","MEDIUM","HIGH"].index)
+        dust_triggers.append("dust_event_prob>=0.05")
 
-        elif hz == "flood":
-            if flood_lvl >= 3:
-                trig.append("flood_level>=3")
-            elif flood_lvl == 2:
-                trig.append("flood_level==2")
-            elif flood_lvl == 1:
-                # keep mainly immediate actions for moderate rainfall
-                if item["time_to_act"] not in ("0-6h", "6-24h"):
-                    include = False
-                trig.append("flood_level==1")
+    # Air quality thresholds (WHO-style references are stricter; here we use pragmatic alert thresholds)
+    if pm10 >= 150:
+        dust_triggered = True
+        dust_priority = "HIGH"
+        dust_triggers.append("pm10>=150")
+    elif pm10 >= 100:
+        dust_triggered = True
+        dust_priority = max(dust_priority, "MEDIUM", key=["LOW","MEDIUM","HIGH"].index)
+        dust_triggers.append("pm10>=100")
 
-        if not include:
-            continue
+    if pm25 >= 75:
+        dust_triggered = True
+        dust_priority = "HIGH"
+        dust_triggers.append("pm25>=75")
+    elif pm25 >= 50:
+        dust_triggered = True
+        dust_priority = max(dust_priority, "MEDIUM", key=["LOW","MEDIUM","HIGH"].index)
+        dust_triggers.append("pm25>=50")
 
-        # Priority: base severity (0..3) scaled
-        priority = 10 * base
+    # Remote-sensing proxy
+    if aod >= 1.0:
+        dust_triggered = True
+        dust_priority = max(dust_priority, "MEDIUM", key=["LOW","MEDIUM","HIGH"].index)
+        dust_triggers.append("aod>=1.0")
 
-        # Sector boosts (keeps urgent actions at top)
-        if hz == "dust" and item["sector"] in ("health", "transport", "operations") and item["time_to_act"] in ("0-6h", "6-24h"):
-            priority += 5
-        if hz == "drought" and item["sector"] in ("water",) and item["time_to_act"] in ("2-7d", "2-4w"):
-            priority += 5
-        if hz == "flood" and item["sector"] in ("emergency", "operations", "transport") and item["time_to_act"] in ("0-6h", "6-24h"):
-            priority += 5
+    # Wind mobilization proxy (supports dust uplift)
+    if wind >= 12:
+        dust_triggered = True
+        dust_priority = max(dust_priority, "MEDIUM", key=["LOW","MEDIUM","HIGH"].index)
+        dust_triggers.append("wind_speed_mean>=12")
 
-        action_id = _stable_id(city, date, hz, item["sector"], item["title"])
+    if dust_triggered:
+        hazards.append("dust")
+        actions.extend(_dust_actions(priority=dust_priority, triggers=dust_triggers))
 
-        triggers = []
-        triggers.extend(dust_notes)
-        triggers.extend(drought_notes)
-        triggers.extend(flood_notes)
-        triggers.extend(trig)
+    # -----------------------------
+    # Drought detection (hybrid)
+    # -----------------------------
+    drought_flag = _to_float(_get(row, "drought_flag_pred", "drought_flag", default=0.0))
+    drought_sev = _norm_label(_get(row, "drought_severity_pred", "drought_severity", default="none"))
+    precip_def = _to_float(_get(row, "precip_deficit_pred", default=0.0))
+    drought_dur = _to_float(_get(row, "drought_duration_pred", default=0.0))
 
-        actions.append(Action(
-            action_id=action_id,
-            hazard=hz,
-            sector=item["sector"],
-            title=item["title"],
-            description=item["description"],
-            lead_agency=item["lead_agency"],
-            time_to_act=item["time_to_act"],
-            cost_level=item["cost_level"],
-            priority=priority,
-            triggers=sorted(list(set([t for t in triggers if t]))),
-        ))
+    drought_triggered = False
+    drought_priority = "LOW"
+    drought_triggers: List[str] = []
 
-    actions.sort(key=lambda a: a.priority, reverse=True)
+    if drought_flag >= 1:
+        drought_triggered = True
+        drought_priority = "HIGH"
+        drought_triggers.append("drought_flag_pred>=1")
+
+    if drought_sev in {"severe", "extreme"}:
+        drought_triggered = True
+        drought_priority = "HIGH"
+        drought_triggers.append(f"drought_severity_pred={drought_sev}")
+    elif drought_sev in {"moderate"}:
+        drought_triggered = True
+        drought_priority = max(drought_priority, "MEDIUM", key=["LOW","MEDIUM","HIGH"].index)
+        drought_triggers.append(f"drought_severity_pred={drought_sev}")
+    elif drought_sev in {"mild", "low"}:
+        drought_triggered = True
+        drought_priority = "LOW"
+        drought_triggers.append(f"drought_severity_pred={drought_sev}")
+
+    # Use precipitation deficit as a proxy when severity labels are 'none'
+    if precip_def >= 10:
+        drought_triggered = True
+        drought_priority = "HIGH"
+        drought_triggers.append("precip_deficit_pred>=10")
+    elif precip_def >= 5:
+        drought_triggered = True
+        drought_priority = max(drought_priority, "MEDIUM", key=["LOW","MEDIUM","HIGH"].index)
+        drought_triggers.append("precip_deficit_pred>=5")
+    elif precip_def >= 2:
+        drought_triggered = True
+        drought_priority = "LOW"
+        drought_triggers.append("precip_deficit_pred>=2")
+
+    # Duration (if your model starts producing it later)
+    if drought_dur >= 21:
+        drought_triggered = True
+        drought_priority = "HIGH"
+        drought_triggers.append("drought_duration_pred>=21")
+    elif drought_dur >= 14:
+        drought_triggered = True
+        drought_priority = max(drought_priority, "MEDIUM", key=["LOW","MEDIUM","HIGH"].index)
+        drought_triggers.append("drought_duration_pred>=14")
+
+    if drought_triggered:
+        hazards.append("drought")
+        actions.extend(_drought_actions(priority=drought_priority, triggers=drought_triggers))
+
+    # -----------------------------
+    # Flood detection (rule-based; currently will not trigger if precip is all zeros)
+    # -----------------------------
+    precip = _to_float(_get(row, "precipitation_sum_pred", default=0.0))
+    precip_norm = _to_float(_get(row, "precipitation_sum_normal", default=0.0))
+
+    flood_triggered = False
+    flood_priority = "LOW"
+    flood_triggers: List[str] = []
+
+    # Absolute daily rainfall thresholds (mm/day)
+    if precip >= 80:
+        flood_triggered = True
+        flood_priority = "HIGH"
+        flood_triggers.append("precipitation_sum_pred>=80mm")
+    elif precip >= 50:
+        flood_triggered = True
+        flood_priority = "MEDIUM"
+        flood_triggers.append("precipitation_sum_pred>=50mm")
+    elif precip >= 30:
+        flood_triggered = True
+        flood_priority = "LOW"
+        flood_triggers.append("precipitation_sum_pred>=30mm")
+
+    # Relative anomaly threshold (compares to "normal" daily climatology)
+    if precip_norm > 0 and precip >= max(20.0, 2.0 * precip_norm):
+        flood_triggered = True
+        flood_priority = max(flood_priority, "MEDIUM", key=["LOW","MEDIUM","HIGH"].index)
+        flood_triggers.append("precipitation_sum_pred>=2x_normal")
+
+    if flood_triggered:
+        hazards.append("flood")
+        actions.extend(_flood_actions(priority=flood_priority, triggers=flood_triggers))
+
+    # -----------------------------
+    # Overall risk
+    # -----------------------------
+    risk_level = _aggregate_risk(hazards, actions)
 
     return MitigationResult(
         city=city,
         date=date,
-        hazards_detected=hazards,
         risk_level=risk_level,
+        hazards_detected=hazards,
         actions=actions,
-        debug=debug,
     )
 
 
-# ---------------------------------------------------------------------
-# Helpers for dashboard integration
-# ---------------------------------------------------------------------
+# -----------------------------
+# Action libraries
+# -----------------------------
+def _dust_actions(priority: str, triggers: List[str]) -> List[Action]:
+    base = [
+        Action(
+            title="Public health advisory (respiratory protection)",
+            hazard="dust",
+            sector="Health",
+            priority=priority,
+            description="Issue advisories for vulnerable groups; recommend masks, reduce outdoor exposure, and prepare clinics for respiratory cases.",
+            lead_agency="Health Directorate / Environmental Authority",
+            time_to_act="Within 6–24 hours",
+            cost_level="Low",
+            triggers=triggers,
+        ),
+        Action(
+            title="Traffic and road safety measures",
+            hazard="dust",
+            sector="Transport",
+            priority=priority,
+            description="Warn drivers about reduced visibility; prepare road patrols; consider limiting heavy transport during peak dust periods.",
+            lead_agency="Traffic Police / Municipality",
+            time_to_act="Within 6–24 hours",
+            cost_level="Low",
+            triggers=triggers,
+        ),
+    ]
+    if priority in {"MEDIUM", "HIGH"}:
+        base.append(
+            Action(
+                title="Sensitive sites protection (schools, hospitals)",
+                hazard="dust",
+                sector="Public Services",
+                priority=priority,
+                description="Improve indoor air filtration where available; limit outdoor school activities; ensure backup power for clinics.",
+                lead_agency="Education Directorate / Hospital Admins",
+                time_to_act="Within 24 hours",
+                cost_level="Medium",
+                triggers=triggers,
+            )
+        )
+    return base
 
+
+def _drought_actions(priority: str, triggers: List[str]) -> List[Action]:
+    base = [
+        Action(
+            title="Water demand management",
+            hazard="drought",
+            sector="Water",
+            priority=priority,
+            description="Implement phased demand reduction, leakage control, and public water-saving campaigns; prioritize critical facilities.",
+            lead_agency="Water Resources Directorate / Municipality",
+            time_to_act="Within 1–7 days",
+            cost_level="Medium",
+            triggers=triggers,
+        ),
+        Action(
+            title="Agricultural irrigation scheduling",
+            hazard="drought",
+            sector="Agriculture",
+            priority=priority,
+            description="Shift to deficit irrigation plans; prioritize high-value crops; promote efficient irrigation and drought-resilient practices.",
+            lead_agency="Agriculture Directorate",
+            time_to_act="Within 1–14 days",
+            cost_level="Medium",
+            triggers=triggers,
+        ),
+    ]
+    if priority in {"MEDIUM", "HIGH"}:
+        base.append(
+            Action(
+                title="Reservoir and groundwater monitoring",
+                hazard="drought",
+                sector="Water",
+                priority=priority,
+                description="Increase monitoring of reservoirs and wells; prepare emergency allocation rules; coordinate with power sector if needed.",
+                lead_agency="Water Resources Directorate",
+                time_to_act="Within 7–21 days",
+                cost_level="Medium",
+                triggers=triggers,
+            )
+        )
+    return base
+
+
+def _flood_actions(priority: str, triggers: List[str]) -> List[Action]:
+    base = [
+        Action(
+            title="Drainage inspection and debris clearing",
+            hazard="flood",
+            sector="Municipal",
+            priority=priority,
+            description="Inspect stormwater drains; clear debris; ensure pumping stations are operational; prioritize known hotspots.",
+            lead_agency="Municipality / Civil Defense",
+            time_to_act="Within 6–24 hours",
+            cost_level="Medium",
+            triggers=triggers,
+        ),
+        Action(
+            title="Early warning and emergency readiness",
+            hazard="flood",
+            sector="Emergency",
+            priority=priority,
+            description="Prepare response teams; issue warnings for low-lying areas; coordinate shelter readiness and rapid response routes.",
+            lead_agency="Civil Defense / Governorate Emergency Cell",
+            time_to_act="Within 6–24 hours",
+            cost_level="Medium",
+            triggers=triggers,
+        ),
+    ]
+    if priority == "HIGH":
+        base.append(
+            Action(
+                title="High-risk zone evacuation planning",
+                hazard="flood",
+                sector="Emergency",
+                priority=priority,
+                description="Prepare evacuation advisories for high-risk zones; ensure communication with local councils and critical infrastructure operators.",
+                lead_agency="Civil Defense / Police",
+                time_to_act="Immediately",
+                cost_level="High",
+                triggers=triggers,
+            )
+        )
+    return base
+
+
+def _aggregate_risk(hazards: List[str], actions: List[Action]) -> str:
+    if not hazards:
+        return "low"
+
+    # Determine max priority among actions
+    pr_map = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
+    max_pr = 1
+    for a in actions:
+        max_pr = max(max_pr, pr_map.get(a.priority, 1))
+
+    # Simple rule: multiple hazards increases severity
+    if len(hazards) >= 2 and max_pr >= 2:
+        return "high"
+    if max_pr == 3:
+        return "high"
+    if max_pr == 2:
+        return "moderate"
+    return "low"
+
+
+# -----------------------------
+# Streamlit helpers
+# -----------------------------
 def result_to_action_cards(result: MitigationResult) -> List[Dict[str, Any]]:
-    """Convert MitigationResult into JSON-serializable dicts for Streamlit."""
-    return [asdict(a) for a in result.actions]
+    cards: List[Dict[str, Any]] = []
+    for a in result.actions:
+        cards.append(
+            {
+                "title": a.title,
+                "hazard": a.hazard,
+                "sector": a.sector,
+                "priority": a.priority,
+                "description": a.description,
+                "lead_agency": a.lead_agency,
+                "time_to_act": a.time_to_act,
+                "cost_level": a.cost_level,
+                "triggers": a.triggers,
+            }
+        )
 
-
-def result_to_log_payload(result: MitigationResult, model_version: str = "unknown") -> Dict[str, Any]:
-    """A compact log payload suitable for S3/DB storage."""
-    return {
-        "logged_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "model_version": model_version,
-        "city": result.city,
-        "date": result.date,
-        "hazards_detected": result.hazards_detected,
-        "risk_level": result.risk_level,
-        "actions": [asdict(a) for a in result.actions],
-        "debug": result.debug,
-    }
-
-
-# ---------------------------------------------------------------------
-# CLI quick test (optional)
-# ---------------------------------------------------------------------
-
-if __name__ == "__main__":
-    sample = {
-        "city": "Mosul",
-        "date": "2026-03-03",
-        "dust_event_pred": 0,
-        "dust_intensity_level": 0,
-        "pm10": 120,
-        "pm25": 60,
-        "aod": 0.2,
-        "wind_speed_mean": 4.0,
-        "drought_flag_pred": 0,
-        "drought_severity_pred": "none",
-        "precip_deficit_pred": -5.0,
-        "drought_duration_pred": 0,
-        "precipitation_sum_pred": 85.0,
-        "precipitation_sum_normal": 20.0,
-    }
-    r = recommend_actions(sample)
-    print(json.dumps(result_to_log_payload(r, model_version="demo_flood"), indent=2))
+    # Sort by priority HIGH > MEDIUM > LOW
+    pr_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    cards.sort(key=lambda x: pr_order.get(x["priority"], 9))
+    return cards
