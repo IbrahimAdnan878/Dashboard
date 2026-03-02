@@ -5,12 +5,16 @@ This version supports reading the latest prediction file directly from Amazon S3
 which is the recommended setup when you deploy the dashboard publicly (e.g.,
 Streamlit Community Cloud).
 
+✅ Added (Option A): Mitigation runs inside Streamlit by importing mitigation_engine.py
+- No extra AWS services required
+- Actions are derived from the selected prediction row (city/date)
+
 Local run:
     pip install -r requirements.txt
-    streamlit run streamlit_app.py
+    streamlit run streamlit_dashboard_app.py
 
 Streamlit Community Cloud (recommended):
-1) Put this file in a GitHub repo.
+1) Put this file + mitigation_engine.py in the SAME GitHub repo folder.
 2) Add requirements (at minimum): streamlit, pandas, boto3
 3) Add Streamlit Secrets (App → Settings → Secrets) like:
 
@@ -46,6 +50,9 @@ from collections.abc import Mapping
 
 import pandas as pd
 import streamlit as st
+
+# ✅ Mitigation engine (must be present in the same folder)
+from mitigation_engine import recommend_actions, result_to_action_cards
 
 # Optional dependency (required for S3 mode)
 try:
@@ -89,11 +96,6 @@ def _secret_get(*keys: str, default=None):
     """
     Robust getter for Streamlit secrets.
     Works with Streamlit's Secrets object (not a plain dict) and with nested TOML sections.
-
-    Examples:
-        _secret_get("aws", "aws_access_key_id")
-        _secret_get("s3", "bucket")
-        _secret_get("AWS_ACCESS_KEY_ID")  # top-level (env-like) secrets
     """
     cur = _secrets_container()
 
@@ -142,15 +144,6 @@ def _has_any_aws_secret() -> bool:
 def _boto3_client():
     """
     Build an S3 client from Streamlit secrets and/or environment variables.
-
-    Priority order:
-      1) Streamlit Secrets nested section: [aws]
-      2) Streamlit Secrets top-level keys: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
-      3) Environment variables: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
-      4) boto3 default credential chain (rarely works on Streamlit Cloud)
-
-    NOTE:
-    - Streamlit Community Cloud does not provide an IAM role, so (1)/(2)/(3) are required.
     """
     if boto3 is None:
         return None
@@ -193,8 +186,6 @@ def _boto3_client():
 def _download_s3_object(bucket: str, key: str, cache_buster: str) -> bytes:
     """
     Download an S3 object and cache it.
-    cache_buster should change when the S3 object changes (ETag/LastModified),
-    so Streamlit cache refreshes automatically.
     """
     client = _boto3_client()
     if client is None:
@@ -206,7 +197,6 @@ def _download_s3_object(bucket: str, key: str, cache_buster: str) -> bytes:
 def _head_s3_object(bucket: str, key: str) -> Tuple[Optional[str], Optional[datetime], Optional[int]]:
     """
     Return (etag, last_modified, size_bytes) for a key.
-    If the object doesn't exist or permissions are missing, returns (None, None, None).
     """
     client = _boto3_client()
     if client is None:
@@ -293,6 +283,29 @@ def _credentials_help_text() -> str:
     )
 
 
+def _build_mitigation_input(row: dict) -> dict:
+    """
+    Normalize ONE selected prediction row to match mitigation_engine expectations.
+    """
+    r = dict(row)
+
+    # Supply date if possible
+    if "timestamp" in r and isinstance(r["timestamp"], pd.Timestamp):
+        r["date"] = r["timestamp"].date().isoformat()
+    elif "date" not in r and "timestamp" in r:
+        r["date"] = str(r["timestamp"]).split(" ")[0]
+
+    # Map drought severity if CSV uses drought_severity_pred
+    if "drought_severity" not in r and "drought_severity_pred" in r:
+        r["drought_severity"] = r.get("drought_severity_pred")
+
+    # Map dust event if needed
+    if "dust_event" not in r and "dust_event_pred" in r:
+        r["dust_event"] = r.get("dust_event_pred")
+
+    return r
+
+
 def main() -> None:
     st.title("30-Day Environmental Forecast Dashboard")
     st.write(
@@ -320,7 +333,6 @@ def main() -> None:
             st.error("S3 mode requires boto3. Add `boto3` to requirements.txt and redeploy.")
             st.stop()
 
-        # Fast, explicit check to avoid confusing boto3 errors on Streamlit Cloud.
         if not _has_any_aws_secret():
             st.error(_credentials_help_text())
             st.stop()
@@ -419,6 +431,14 @@ def main() -> None:
         "drought_flag_pred",
         "dust_event_pred",
         "dust_intensity_code",
+        "dust_intensity_level",
+        "pm10_pred",
+        "pm25_pred",
+        "aod_pred",
+        "wind_speed_10m_pred",
+        "precip_30d_sum_pred",
+        "soil_moisture_rootzone_30d_mean_pred",
+        "vpd_30d_mean_pred",
     ]
     df = coerce_numeric(df, numeric_candidates)
 
@@ -476,61 +496,119 @@ def main() -> None:
     st.divider()
 
     # ----------------------------
-    # Charts
+    # Tabs
     # ----------------------------
-    st.subheader("Time-series depiction")
-
-    if "timestamp" in df_city.columns and pd.api.types.is_datetime64_any_dtype(df_city["timestamp"]):
-        df_plot = df_city.set_index("timestamp")
-    else:
-        df_plot = df_city.copy()
-        df_plot.index = range(len(df_plot))
-
-    default_plot_cols = [c for c in ["dust_event_prob", "pm10", "pm25", "aod", "temp_mean", "wind_speed_mean"] if c in df_city.columns]
-    numeric_cols = [
-        c for c in df_city.columns
-        if pd.api.types.is_numeric_dtype(df_city[c]) and c not in ["dust_event_pred", "drought_flag_pred"]
-    ]
-
-    plot_cols = st.multiselect(
-        "Select numeric variables to plot",
-        options=numeric_cols,
-        default=default_plot_cols if default_plot_cols else numeric_cols[:3],
-        help="Choose one or more numeric columns. Each selection will be displayed as a line chart.",
-    )
-
-    if plot_cols:
-        st.line_chart(df_plot[plot_cols])
-    else:
-        st.info("Select at least one numeric variable to display a chart.")
-
-    st.subheader("Categorical predictions (overview)")
-    cat_cols = [c for c in ["drought_severity_pred", "dust_intensity_level"] if c in df_city.columns]
-    if cat_cols:
-        st.dataframe(df_city[["timestamp"] + cat_cols].reset_index(drop=True), use_container_width=True)
-    else:
-        st.write("No categorical severity columns found (e.g., drought_severity_pred, dust_intensity_level).")
-
-    st.subheader("Filtered dataset (table)")
-    st.dataframe(df_city.reset_index(drop=True), use_container_width=True)
+    tab_viz, tab_mitig, tab_data = st.tabs(["📊 Visualization", "🛡️ Mitigation (Actions)", "📄 Data & Export"])
 
     # ----------------------------
-    # Download filtered data
+    # Visualization tab (unchanged logic)
     # ----------------------------
-    st.subheader("Export")
-    csv_out = df_city.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="Download filtered CSV",
-        data=csv_out,
-        file_name=f"{selected_city}_filtered_predictions.csv",
-        mime="text/csv",
-    )
+    with tab_viz:
+        st.subheader("Time-series depiction")
 
-    st.caption(
-        "Tip: In production, keep the dashboard reading from "
-        "`datasets/predictions/unified_next30_predictions_LATEST.csv` in S3. "
-        "This gives a stable endpoint for the latest results."
-    )
+        if "timestamp" in df_city.columns and pd.api.types.is_datetime64_any_dtype(df_city["timestamp"]):
+            df_plot = df_city.set_index("timestamp")
+        else:
+            df_plot = df_city.copy()
+            df_plot.index = range(len(df_plot))
+
+        default_plot_cols = [c for c in ["dust_event_prob", "pm10", "pm25", "aod", "temp_mean", "wind_speed_mean"] if c in df_city.columns]
+        numeric_cols = [
+            c for c in df_city.columns
+            if pd.api.types.is_numeric_dtype(df_city[c]) and c not in ["dust_event_pred", "drought_flag_pred"]
+        ]
+
+        plot_cols = st.multiselect(
+            "Select numeric variables to plot",
+            options=numeric_cols,
+            default=default_plot_cols if default_plot_cols else numeric_cols[:3],
+            help="Choose one or more numeric columns. Each selection will be displayed as a line chart.",
+        )
+
+        if plot_cols:
+            st.line_chart(df_plot[plot_cols])
+        else:
+            st.info("Select at least one numeric variable to display a chart.")
+
+        st.subheader("Categorical predictions (overview)")
+        cat_cols = [c for c in ["drought_severity_pred", "dust_intensity_level"] if c in df_city.columns]
+        if cat_cols:
+            st.dataframe(df_city[["timestamp"] + cat_cols].reset_index(drop=True), use_container_width=True)
+        else:
+            st.write("No categorical severity columns found (e.g., drought_severity_pred, dust_intensity_level).")
+
+    # ----------------------------
+    # Mitigation tab
+    # ----------------------------
+    with tab_mitig:
+        st.subheader("Mitigation Recommendations (Option A)")
+        st.write(
+            "Select a single day. The dashboard will take that prediction row and run mitigation rules "
+            "locally using `mitigation_engine.py`."
+        )
+
+        if df_city.empty:
+            st.info("No rows available after filtering.")
+        else:
+            chosen_row = None
+
+            if "timestamp" in df_city.columns and pd.api.types.is_datetime64_any_dtype(df_city["timestamp"]):
+                dates = sorted(df_city["timestamp"].dropna().dt.date.unique().tolist())
+                chosen_date = st.selectbox("Choose a date", options=dates, index=0)
+
+                row_df = df_city[df_city["timestamp"].dt.date == chosen_date]
+                if row_df.empty:
+                    st.warning("No row found for this date.")
+                else:
+                    chosen_row = row_df.iloc[0].to_dict()
+            else:
+                chosen_row = df_city.iloc[0].to_dict()
+
+            if chosen_row is not None:
+                chosen_row["city"] = selected_city
+                row_norm = _build_mitigation_input(chosen_row)
+
+                # Run mitigation engine
+                result = recommend_actions(row_norm)
+
+                st.markdown(f"### Summary — {result.city} — {result.date}")
+                st.write(f"Detected hazards: {', '.join(result.hazards_detected) if result.hazards_detected else 'None'}")
+                st.write(f"Overall risk level: **{result.risk_level.upper()}**")
+
+                cards = result_to_action_cards(result)
+                if not cards:
+                    st.success("No mitigation actions triggered for this record.")
+                else:
+                    for c in cards:
+                        with st.container(border=True):
+                            st.markdown(f"### {c['title']}")
+                            st.caption(f"Hazard: {c['hazard']} | Sector: {c['sector']} | Priority: {c['priority']}")
+                            st.write(c["description"])
+                            st.write(f"**Lead agency:** {c['lead_agency']}")
+                            st.write(f"**Time to act:** {c['time_to_act']}  |  **Cost:** {c['cost_level']}")
+                            st.caption("Triggers: " + ", ".join(c["triggers"]))
+
+    # ----------------------------
+    # Data & Export tab
+    # ----------------------------
+    with tab_data:
+        st.subheader("Filtered dataset (table)")
+        st.dataframe(df_city.reset_index(drop=True), use_container_width=True)
+
+        st.subheader("Export")
+        csv_out = df_city.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="Download filtered CSV",
+            data=csv_out,
+            file_name=f"{selected_city}_filtered_predictions.csv",
+            mime="text/csv",
+        )
+
+        st.caption(
+            "Tip: In production, keep the dashboard reading from "
+            "`datasets/predictions/unified_next30_predictions_LATEST.csv` in S3. "
+            "This gives a stable endpoint for the latest results."
+        )
 
 
 if __name__ == "__main__":
