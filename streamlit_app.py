@@ -11,7 +11,7 @@ Streamlit Community Cloud).
 
 Local run:
     pip install -r requirements.txt
-    streamlit run streamlit_dashboard_app.py
+    streamlit run streamlit_app.py
 
 Streamlit Community Cloud (recommended):
 1) Put this file + mitigation_engine.py in the SAME GitHub repo folder.
