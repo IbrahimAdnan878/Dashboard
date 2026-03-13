@@ -1,10 +1,6 @@
 
 # streamlit_app.py
-# Corrected Streamlit dashboard that:
-# - reads predictions from S3 / upload / local files
-# - reads metrics from S3 / upload / local files
-# - supports Streamlit secrets for AWS and S3 paths
-# - fixes display-only logic: if drought_flag_pred == 0 -> drought_severity_pred = "none"
+# Auto-loading Streamlit dashboard for predictions + metrics from S3 / upload / local files
 
 from __future__ import annotations
 
@@ -87,12 +83,18 @@ def _boto3_client():
     return boto3.client("s3", **kwargs)
 
 
-def download_s3(bucket: str, key: str) -> bytes:
+@st.cache_data(show_spinner=False)
+def download_s3_cached(bucket: str, key: str) -> bytes:
     client = _boto3_client()
     if client is None:
         raise RuntimeError("boto3 is not installed. Add boto3 to requirements.txt.")
     obj = client.get_object(Bucket=bucket, Key=key)
     return obj["Body"].read()
+
+
+@st.cache_data(show_spinner=False)
+def read_csv_bytes(data: bytes) -> pd.DataFrame:
+    return pd.read_csv(io.BytesIO(data))
 
 
 def safe_datetime(df: pd.DataFrame, col: str) -> pd.DataFrame:
@@ -110,7 +112,7 @@ def apply_display_fix(df: pd.DataFrame) -> pd.DataFrame:
 
 st.title("30-Day Environmental Forecast Dashboard")
 
-mode = st.sidebar.radio("Data source", ["S3", "Upload CSV", "Local files"])
+mode = st.sidebar.radio("Data source", ["S3", "Upload CSV", "Local files"], index=0)
 
 pred_df = None
 metrics_df = None
@@ -131,26 +133,34 @@ if mode == "S3":
         _secret_get("s3", "metrics_latest_key", default=DEFAULT_METRICS_KEY),
     )
 
-    if st.sidebar.button("Load from S3", use_container_width=True):
+    refresh = st.sidebar.button("Refresh S3 files", use_container_width=True)
+
+    try:
+        if refresh:
+            download_s3_cached.clear()
+            read_csv_bytes.clear()
+
+        pred_bytes = download_s3_cached(bucket, pred_key)
+        pred_df = read_csv_bytes(pred_bytes)
+
         try:
-            pred_bytes = download_s3(bucket, pred_key)
-            pred_df = pd.read_csv(io.BytesIO(pred_bytes))
+            metrics_bytes = download_s3_cached(bucket, metrics_key)
+            metrics_df = read_csv_bytes(metrics_bytes)
+        except Exception:
+            metrics_df = None
+            st.sidebar.warning("Metrics file was not found or could not be read from S3.")
 
-            try:
-                metrics_bytes = download_s3(bucket, metrics_key)
-                metrics_df = pd.read_csv(io.BytesIO(metrics_bytes))
-            except Exception:
-                st.warning("Predictions loaded, but the metrics file was not found or could not be read from S3.")
+        st.sidebar.success("Loaded automatically from S3.")
 
-        except (NoCredentialsError, PartialCredentialsError):
-            st.error("AWS credentials were not found. Add them in Streamlit Secrets under [aws].")
-            st.stop()
-        except ClientError as e:
-            st.error(f"S3 access error: {e}")
-            st.stop()
-        except Exception as e:
-            st.error(f"S3 load error: {e}")
-            st.stop()
+    except (NoCredentialsError, PartialCredentialsError):
+        st.error("AWS credentials were not found. Add them in Streamlit Secrets under [aws].")
+        st.stop()
+    except ClientError as e:
+        st.error(f"S3 access error: {e}")
+        st.stop()
+    except Exception as e:
+        st.error(f"S3 load error: {e}")
+        st.stop()
 
 elif mode == "Upload CSV":
     pred_file = st.sidebar.file_uploader("Upload predictions CSV", type=["csv"])
@@ -173,7 +183,7 @@ else:
         metrics_df = pd.read_csv(metrics_path)
 
 if pred_df is None:
-    st.info("Choose a data source and load a predictions dataset to start.")
+    st.info("No predictions dataset is loaded yet.")
     st.stop()
 
 pred_df = safe_datetime(pred_df, "timestamp")
@@ -223,7 +233,12 @@ with tab_viz:
     numeric_cols = [c for c in df_city.columns if pd.api.types.is_numeric_dtype(df_city[c])]
 
     if numeric_cols:
-        cols = st.multiselect("Select variables", numeric_cols, default=numeric_cols[: min(3, len(numeric_cols))])
+        cols = st.multiselect(
+            "Select variables",
+            numeric_cols,
+            default=numeric_cols[: min(3, len(numeric_cols))],
+            key="viz_cols",
+        )
         if cols:
             st.line_chart(df_plot[cols])
         else:
@@ -242,7 +257,13 @@ with tab_metrics:
         numeric_metrics = [c for c in metrics_df.columns if pd.api.types.is_numeric_dtype(metrics_df[c])]
 
         if numeric_metrics:
-            metric = st.selectbox("Visualize metric", numeric_metrics)
+            default_metric = "accuracy" if "accuracy" in numeric_metrics else numeric_metrics[0]
+            metric = st.selectbox(
+                "Visualize metric",
+                numeric_metrics,
+                index=numeric_metrics.index(default_metric),
+                key="metric_select",
+            )
             index_col = metrics_df.columns[0]
             st.bar_chart(metrics_df.set_index(index_col)[metric])
         else:
