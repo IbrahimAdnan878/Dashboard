@@ -1,12 +1,12 @@
-
 # streamlit_app.py
-# Auto-loading Streamlit dashboard for:
+# Final Streamlit dashboard:
+# - auto-load from S3 on every rerun
 # - predictions visualization
-# - mitigation recommendations
-# - model metrics
+# - mitigation single-day recommendations
+# - mitigation report download for selected city and selected period
+# - model metrics tab
 # - filtered data export
-# - display-only drought severity fix
-# - S3 / upload / local file modes
+# - display-only fix: if drought_flag_pred == 0 -> drought_severity_pred = "none"
 
 from __future__ import annotations
 
@@ -17,8 +17,11 @@ from collections.abc import Mapping
 import pandas as pd
 import streamlit as st
 
-# Mitigation engine
 from mitigation_engine import recommend_actions, result_to_action_cards
+from mitigation_report_helpers import (
+    build_mitigation_report_for_all_days,
+    mitigation_report_to_csv_bytes,
+)
 
 try:
     import boto3
@@ -39,7 +42,6 @@ st.set_page_config(
 DEFAULT_PRED_FILE = "unified_next30_predictions.csv"
 DEFAULT_METRICS_FILE = "unified_next30_metrics.csv"
 DEFAULT_BUCKET = "ibrahim1995-dust-datasets"
-DEFAULT_PREFIX = "datasets/predictions/"
 DEFAULT_PRED_KEY = "datasets/predictions/unified_next30_predictions_LATEST.csv"
 DEFAULT_METRICS_KEY = "datasets/predictions/unified_next30_metrics_LATEST.csv"
 
@@ -138,6 +140,44 @@ def _build_mitigation_input(row: dict) -> dict:
     return r
 
 
+def run_mitigation_from_row(row_dict: dict) -> dict:
+    """
+    Adapter between one dashboard prediction row and mitigation_report_helpers.py.
+    """
+    row_norm = _build_mitigation_input(row_dict)
+    result = recommend_actions(row_norm)
+    cards = result_to_action_cards(result)
+
+    action_texts = []
+    for card in cards:
+        title = str(card.get("title", "")).strip()
+        description = str(card.get("description", "")).strip()
+
+        if title and description:
+            action_texts.append(f"{title}: {description}")
+        elif title:
+            action_texts.append(title)
+        elif description:
+            action_texts.append(description)
+
+    hazards = getattr(result, "hazards_detected", []) or []
+    risk_level = getattr(result, "risk_level", None)
+    city = getattr(result, "city", row_norm.get("city"))
+    date = getattr(result, "date", row_norm.get("date"))
+
+    summary = f"Hazards: {', '.join(hazards) if hazards else 'None'} | Risk: {risk_level}"
+
+    return {
+        "status": "ok",
+        "city": city,
+        "date": date,
+        "risk_level": risk_level,
+        "actions": action_texts,
+        "summary": summary,
+        "hazards_detected": hazards,
+    }
+
+
 st.title("30-Day Environmental Forecast Dashboard")
 
 mode = st.sidebar.radio("Data source", ["S3", "Upload CSV", "Local files"], index=0)
@@ -231,8 +271,11 @@ if not cities:
     st.error("No city values were found in the predictions dataset.")
     st.stop()
 
-city = st.sidebar.selectbox("City", cities)
-df_city = pred_df[pred_df["city"].astype(str) == city].copy()
+selected_city = st.sidebar.selectbox("City", cities)
+df_city = pred_df[pred_df["city"].astype(str) == selected_city].copy()
+
+selected_start_date = None
+selected_end_date = None
 
 if "timestamp" in df_city.columns and pd.api.types.is_datetime64_any_dtype(df_city["timestamp"]):
     df_city = df_city.sort_values("timestamp")
@@ -248,16 +291,19 @@ if "timestamp" in df_city.columns and pd.api.types.is_datetime64_any_dtype(df_ci
         )
 
         if isinstance(date_range, tuple) and len(date_range) == 2:
-            start_date, end_date = date_range
+            selected_start_date, selected_end_date = date_range
         else:
-            start_date = date_range
-            end_date = date_range
+            selected_start_date = date_range
+            selected_end_date = date_range
 
-        mask = (df_city["timestamp"].dt.date >= start_date) & (df_city["timestamp"].dt.date <= end_date)
+        mask = (
+            (df_city["timestamp"].dt.date >= selected_start_date)
+            & (df_city["timestamp"].dt.date <= selected_end_date)
+        )
         df_city = df_city.loc[mask].copy()
 
 col1, col2, col3 = st.columns(3)
-col1.metric("City", city)
+col1.metric("City", selected_city)
 col2.metric("Rows", len(df_city))
 
 if "dust_event_pred" in df_city.columns:
@@ -317,7 +363,11 @@ with tab_mitig:
             available_dates = sorted(df_city["timestamp"].dropna().dt.date.unique().tolist())
 
             if available_dates:
-                chosen_date = st.selectbox("Choose a date", available_dates, key="mitigation_date")
+                chosen_date = st.selectbox(
+                    "Choose one day for detailed actions",
+                    available_dates,
+                    key="mitigation_date",
+                )
                 row_df = df_city[df_city["timestamp"].dt.date == chosen_date]
 
                 if not row_df.empty:
@@ -328,15 +378,19 @@ with tab_mitig:
             chosen_row = df_city.iloc[0].to_dict()
 
         if chosen_row is not None:
-            chosen_row["city"] = city
+            chosen_row["city"] = selected_city
             row_norm = _build_mitigation_input(chosen_row)
 
             result = recommend_actions(row_norm)
 
-            st.markdown(f"### Summary — {result.city} — {result.date}")
-            hazards_text = ", ".join(result.hazards_detected) if result.hazards_detected else "None"
+            st.markdown(
+                f"### Single-day summary — {getattr(result, 'city', selected_city)} — "
+                f"{getattr(result, 'date', row_norm.get('date', 'N/A'))}"
+            )
+
+            hazards_text = ", ".join(getattr(result, "hazards_detected", []) or []) or "None"
             st.write(f"Detected hazards: {hazards_text}")
-            st.write(f"Overall risk level: **{result.risk_level.upper()}**")
+            st.write(f"Overall risk level: **{str(getattr(result, 'risk_level', 'unknown')).upper()}**")
 
             cards = result_to_action_cards(result)
             if not cards:
@@ -354,6 +408,35 @@ with tab_mitig:
                         triggers = c.get("triggers", [])
                         if triggers:
                             st.caption("Triggers: " + ", ".join(triggers))
+
+        st.divider()
+        st.subheader("Mitigation report for selected city and selected period")
+
+        mitigation_report_df = build_mitigation_report_for_all_days(
+            prediction_df=df_city,
+            mitigation_callback=run_mitigation_from_row,
+            city=selected_city,
+        )
+
+        if mitigation_report_df.empty:
+            st.info("No mitigation report rows were produced for the current filters.")
+        else:
+            st.dataframe(mitigation_report_df, use_container_width=True)
+
+            if selected_start_date and selected_end_date:
+                report_file_name = (
+                    f"mitigation_report_{selected_city}_{selected_start_date}_{selected_end_date}.csv"
+                )
+            else:
+                report_file_name = f"mitigation_report_{selected_city}.csv"
+
+            st.download_button(
+                label="Download mitigation report CSV for selected city and period",
+                data=mitigation_report_to_csv_bytes(mitigation_report_df),
+                file_name=report_file_name,
+                mime="text/csv",
+                use_container_width=True,
+            )
 
 with tab_metrics:
     st.subheader("Model Performance Metrics")
@@ -386,7 +469,7 @@ with tab_data:
     st.download_button(
         "Download CSV",
         csv,
-        f"{city}_predictions.csv",
+        f"{selected_city}_predictions.csv",
         "text/csv",
         use_container_width=True,
     )
