@@ -66,14 +66,14 @@ if mode == "S3":
     bucket = st.sidebar.text_input("S3 Bucket", DEFAULT_BUCKET)
 
     pred_key = st.sidebar.text_input(
-        "Predictions file",
-        DEFAULT_PREFIX + "unified_next30_predictions_LATEST.csv"
-    )
+    "Predictions file",
+    _secret_get("s3", "predictions_latest_key", default=DEFAULT_PREFIX + "unified_next30_predictions_LATEST.csv")
+)
 
-    metrics_key = st.sidebar.text_input(
-        "Metrics file",
-        DEFAULT_PREFIX + "unified_next30_metrics_LATEST.csv"
-    )
+  metrics_key = st.sidebar.text_input(
+    "Metrics file",
+    _secret_get("s3", "metrics_latest_key", default=DEFAULT_PREFIX + "unified_next30_metrics_LATEST.csv")
+)
 
     if st.sidebar.button("Load from S3"):
 
