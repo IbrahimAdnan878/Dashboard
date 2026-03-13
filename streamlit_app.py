@@ -1,6 +1,12 @@
 
 # streamlit_app.py
-# Auto-loading Streamlit dashboard for predictions + metrics from S3 / upload / local files
+# Auto-loading Streamlit dashboard for:
+# - predictions visualization
+# - mitigation recommendations
+# - model metrics
+# - filtered data export
+# - display-only drought severity fix
+# - S3 / upload / local file modes
 
 from __future__ import annotations
 
@@ -10,6 +16,9 @@ from collections.abc import Mapping
 
 import pandas as pd
 import streamlit as st
+
+# Mitigation engine
+from mitigation_engine import recommend_actions, result_to_action_cards
 
 try:
     import boto3
@@ -110,6 +119,25 @@ def apply_display_fix(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _build_mitigation_input(row: dict) -> dict:
+    r = dict(row)
+
+    if "timestamp" in r:
+        ts = r["timestamp"]
+        if isinstance(ts, pd.Timestamp):
+            r["date"] = ts.date().isoformat()
+        else:
+            r["date"] = str(ts).split(" ")[0]
+
+    if "drought_severity" not in r and "drought_severity_pred" in r:
+        r["drought_severity"] = r.get("drought_severity_pred")
+
+    if "dust_event" not in r and "dust_event_pred" in r:
+        r["dust_event"] = r.get("dust_event_pred")
+
+    return r
+
+
 st.title("30-Day Environmental Forecast Dashboard")
 
 mode = st.sidebar.radio("Data source", ["S3", "Upload CSV", "Local files"], index=0)
@@ -206,6 +234,28 @@ if not cities:
 city = st.sidebar.selectbox("City", cities)
 df_city = pred_df[pred_df["city"].astype(str) == city].copy()
 
+if "timestamp" in df_city.columns and pd.api.types.is_datetime64_any_dtype(df_city["timestamp"]):
+    df_city = df_city.sort_values("timestamp")
+    min_date = df_city["timestamp"].min()
+    max_date = df_city["timestamp"].max()
+
+    if pd.notna(min_date) and pd.notna(max_date):
+        date_range = st.sidebar.date_input(
+            "Date range",
+            value=(min_date.date(), max_date.date()),
+            min_value=min_date.date(),
+            max_value=max_date.date(),
+        )
+
+        if isinstance(date_range, tuple) and len(date_range) == 2:
+            start_date, end_date = date_range
+        else:
+            start_date = date_range
+            end_date = date_range
+
+        mask = (df_city["timestamp"].dt.date >= start_date) & (df_city["timestamp"].dt.date <= end_date)
+        df_city = df_city.loc[mask].copy()
+
 col1, col2, col3 = st.columns(3)
 col1.metric("City", city)
 col2.metric("Rows", len(df_city))
@@ -219,13 +269,14 @@ else:
 
 st.divider()
 
-tab_viz, tab_metrics, tab_data = st.tabs(["📊 Visualization", "📏 Model Metrics", "📄 Data"])
+tab_viz, tab_mitig, tab_metrics, tab_data = st.tabs(
+    ["📊 Visualization", "🛡️ Mitigation", "📏 Model Metrics", "📄 Data"]
+)
 
 with tab_viz:
     st.subheader("Time Series")
 
     if "timestamp" in df_city.columns and pd.api.types.is_datetime64_any_dtype(df_city["timestamp"]):
-        df_city = df_city.sort_values("timestamp")
         df_plot = df_city.set_index("timestamp")
     else:
         df_plot = df_city.copy()
@@ -245,6 +296,64 @@ with tab_viz:
             st.info("Select at least one numeric variable.")
     else:
         st.info("No numeric columns were found for plotting.")
+
+    st.subheader("Categorical Predictions")
+    cat_cols = [c for c in ["drought_severity_pred", "dust_intensity_level"] if c in df_city.columns]
+    if cat_cols:
+        display_cols = ["timestamp"] + cat_cols if "timestamp" in df_city.columns else cat_cols
+        st.dataframe(df_city[display_cols].reset_index(drop=True), use_container_width=True)
+    else:
+        st.info("No categorical severity columns were found.")
+
+with tab_mitig:
+    st.subheader("Mitigation Recommendations")
+
+    if df_city.empty:
+        st.info("No rows are available after filtering.")
+    else:
+        chosen_row = None
+
+        if "timestamp" in df_city.columns and pd.api.types.is_datetime64_any_dtype(df_city["timestamp"]):
+            available_dates = sorted(df_city["timestamp"].dropna().dt.date.unique().tolist())
+
+            if available_dates:
+                chosen_date = st.selectbox("Choose a date", available_dates, key="mitigation_date")
+                row_df = df_city[df_city["timestamp"].dt.date == chosen_date]
+
+                if not row_df.empty:
+                    chosen_row = row_df.iloc[0].to_dict()
+            else:
+                chosen_row = df_city.iloc[0].to_dict()
+        else:
+            chosen_row = df_city.iloc[0].to_dict()
+
+        if chosen_row is not None:
+            chosen_row["city"] = city
+            row_norm = _build_mitigation_input(chosen_row)
+
+            result = recommend_actions(row_norm)
+
+            st.markdown(f"### Summary — {result.city} — {result.date}")
+            hazards_text = ", ".join(result.hazards_detected) if result.hazards_detected else "None"
+            st.write(f"Detected hazards: {hazards_text}")
+            st.write(f"Overall risk level: **{result.risk_level.upper()}**")
+
+            cards = result_to_action_cards(result)
+            if not cards:
+                st.success("No mitigation actions were triggered for this record.")
+            else:
+                for c in cards:
+                    with st.container(border=True):
+                        st.markdown(f"### {c['title']}")
+                        st.caption(
+                            f"Hazard: {c['hazard']} | Sector: {c['sector']} | Priority: {c['priority']}"
+                        )
+                        st.write(c["description"])
+                        st.write(f"**Lead agency:** {c['lead_agency']}")
+                        st.write(f"**Time to act:** {c['time_to_act']} | **Cost:** {c['cost_level']}")
+                        triggers = c.get("triggers", [])
+                        if triggers:
+                            st.caption("Triggers: " + ", ".join(triggers))
 
 with tab_metrics:
     st.subheader("Model Performance Metrics")
