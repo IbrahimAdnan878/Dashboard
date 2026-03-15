@@ -1,4 +1,4 @@
-# streamlit_app.py
+# streamlit_app_with_xgboost_s3.py
 # Final Streamlit dashboard:
 # - auto-load from S3 on every rerun
 # - predictions visualization
@@ -7,6 +7,7 @@
 # - model metrics tab
 # - filtered data export
 # - display-only fix: if drought_flag_pred == 0 -> drought_severity_pred = "none"
+# - supports both Random Forest and XGBoost prediction files from S3
 
 from __future__ import annotations
 
@@ -42,8 +43,26 @@ st.set_page_config(
 DEFAULT_PRED_FILE = "unified_next30_predictions.csv"
 DEFAULT_METRICS_FILE = "unified_next30_metrics.csv"
 DEFAULT_BUCKET = "ibrahim1995-dust-datasets"
+
+# Random Forest S3 defaults
 DEFAULT_PRED_KEY = "datasets/predictions/unified_next30_predictions_LATEST.csv"
 DEFAULT_METRICS_KEY = "datasets/predictions/unified_next30_metrics_LATEST.csv"
+
+# XGBoost S3 defaults
+DEFAULT_PRED_KEY_XGB = "datasets/predictions/xgboost/unified_next30_predictions_LATEST.csv"
+DEFAULT_METRICS_KEY_XGB = "datasets/predictions/xgboost/unified_next30_metrics_LATEST.csv"
+
+
+MODEL_S3_KEY_DEFAULTS = {
+    "Random Forest": {
+        "pred": DEFAULT_PRED_KEY,
+        "metrics": DEFAULT_METRICS_KEY,
+    },
+    "XGBoost": {
+        "pred": DEFAULT_PRED_KEY_XGB,
+        "metrics": DEFAULT_METRICS_KEY_XGB,
+    },
+}
 
 
 def _secrets_container():
@@ -51,6 +70,7 @@ def _secrets_container():
         return st.secrets
     except Exception:
         return {}
+
 
 
 def _secret_get(*keys: str, default=None):
@@ -72,6 +92,7 @@ def _secret_get(*keys: str, default=None):
             return default
 
     return cur
+
 
 
 def _boto3_client():
@@ -108,10 +129,12 @@ def read_csv_bytes(data: bytes) -> pd.DataFrame:
     return pd.read_csv(io.BytesIO(data))
 
 
+
 def safe_datetime(df: pd.DataFrame, col: str) -> pd.DataFrame:
     if col in df.columns:
         df[col] = pd.to_datetime(df[col], errors="coerce")
     return df
+
 
 
 def apply_display_fix(df: pd.DataFrame) -> pd.DataFrame:
@@ -119,6 +142,7 @@ def apply_display_fix(df: pd.DataFrame) -> pd.DataFrame:
         mask = pd.to_numeric(df["drought_flag_pred"], errors="coerce").fillna(0) == 0
         df.loc[mask, "drought_severity_pred"] = "none"
     return df
+
 
 
 def _build_mitigation_input(row: dict) -> dict:
@@ -138,6 +162,7 @@ def _build_mitigation_input(row: dict) -> dict:
         r["dust_event"] = r.get("dust_event_pred")
 
     return r
+
 
 
 def run_mitigation_from_row(row_dict: dict) -> dict:
@@ -191,14 +216,23 @@ if mode == "S3":
         _secret_get("s3", "bucket", default=DEFAULT_BUCKET),
     )
 
+    s3_model = st.sidebar.selectbox(
+        "S3 model source",
+        ["Random Forest", "XGBoost"],
+        index=0,
+    )
+
+    default_pred_key = MODEL_S3_KEY_DEFAULTS[s3_model]["pred"]
+    default_metrics_key = MODEL_S3_KEY_DEFAULTS[s3_model]["metrics"]
+
     pred_key = st.sidebar.text_input(
         "Predictions file",
-        _secret_get("s3", "predictions_latest_key", default=DEFAULT_PRED_KEY),
+        default_pred_key,
     )
 
     metrics_key = st.sidebar.text_input(
         "Metrics file",
-        _secret_get("s3", "metrics_latest_key", default=DEFAULT_METRICS_KEY),
+        default_metrics_key,
     )
 
     refresh = st.sidebar.button("Refresh S3 files", use_container_width=True)
@@ -218,7 +252,7 @@ if mode == "S3":
             metrics_df = None
             st.sidebar.warning("Metrics file was not found or could not be read from S3.")
 
-        st.sidebar.success("Loaded automatically from S3.")
+        st.sidebar.success(f"Loaded automatically from S3 ({s3_model}).")
 
     except (NoCredentialsError, PartialCredentialsError):
         st.error("AWS credentials were not found. Add them in Streamlit Secrets under [aws].")
